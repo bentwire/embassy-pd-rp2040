@@ -6,15 +6,25 @@
 use core::{cell::RefCell, panic};
 
 use defmt::*;
+use embassy_embedded_hal::shared_bus::blocking::spi::SpiDeviceWithConfig;
 use embassy_executor::Spawner;
-use embassy_rp::i2c::{self, Config};
+use embassy_rp::{
+    gpio::{Level, Output},
+    i2c::{self, I2c},
+    peripherals::USB,
+    spi::{self, Spi},
+};
 use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
 use embassy_sync::blocking_mutex::Mutex;
 use embassy_time::{Instant, Timer};
 //use embedded_hal_1::i2c::I2c;
 
 use usb_pd::{
-    pdo::{self, PowerDataObject, VDMHeader},
+    header::{DataMessageType, Header, SpecificationRevision},
+    pdo::{
+        self, CertStatVDO, PowerDataObject, ProductVDO, UFPTypeVDO, UFPVDOVersion, USBHighestSpeed,
+        VDMHeader, VDMVersionMajor, VDMVersionMinor, VconnPower, VendorDataObject,
+    },
     sink::{Event, Request, Sink},
 };
 
@@ -60,16 +70,80 @@ async fn main(spawner: Spawner) {
         &__storage_b_start as *const _ as u32
     });
 
+    // Initialize I2C0 and FUSB302B
     let i2c0_sda = p.PIN_0;
     let i2c0_scl = p.PIN_1;
 
-    let i2c0 = i2c::I2c::new_blocking(p.I2C0, i2c0_scl, i2c0_sda, Config::default());
+    let i2c0 = I2c::new_blocking(p.I2C0, i2c0_scl, i2c0_sda, i2c::Config::default());
     let fusb = fusb302b::Fusb302b::new(i2c0);
     let mut sink = Sink::new(fusb);
 
     sink.init();
 
+    // Spawn PD task
     spawner.spawn(pd_task(sink)).unwrap();
+
+    // Initialize SPI0 and display
+    let spi0_tx = p.PIN_7;
+    let spi0_rx = p.PIN_4;
+    let spi0_sck = p.PIN_6;
+
+    let dis_cs = p.PIN_5;
+    let dis_dc = p.PIN_9;
+    let dis_rst = p.PIN_10;
+
+    let mut spi0_config = spi::Config::default();
+    spi0_config.frequency = 64_000_000; // 64 MHz
+    spi0_config.phase = spi::Phase::CaptureOnSecondTransition;
+    spi0_config.polarity = spi::Polarity::IdleHigh;
+
+    let spi0 = Spi::new_blocking(p.SPI0, spi0_sck, spi0_tx, spi0_rx, spi0_config.clone());
+    let spi0_bus: Mutex<CriticalSectionRawMutex, _> = Mutex::new(RefCell::new(spi0));
+
+    let dis_spi =
+        SpiDeviceWithConfig::new(&spi0_bus, Output::new(dis_cs, Level::High), spi0_config);
+
+    let pd_header = Header(0)
+        .with_message_type_raw(DataMessageType::VendorDefined as u8)
+        .with_num_objects(5) // 5 VDOs, vdm header, id header, cert, product, UFP product type
+        .with_port_data_role(usb_pd::DataRole::Ufp)
+        .with_port_power_role(usb_pd::PowerRole::Sink)
+        .with_spec_revision(SpecificationRevision::R3_0);
+
+    let vdm_header_vdo = pdo::VDMHeader::Structured(
+        pdo::VDMHeaderStructured(0)
+            .with_command(pdo::VDMCommand::DiscoverIdentity)
+            .with_command_type(pdo::VDMCommandType::ResponderACK)
+            .with_object_position(0) // 0 Must be used for descover identity
+            .with_standard_or_vid(0xff00) // PD SID must be used with descover identity
+            .with_vdm_type(pdo::VDMType::Structured)
+            .with_vdm_version_major(VDMVersionMajor::Version2x.into())
+            .with_vdm_version_minor(VDMVersionMinor::Version21.into()),
+    );
+
+    let id_header_vdo = pdo::VDMIdentityHeader(0)
+        .with_host_data(false)
+        .with_device_data(true)
+        .with_product_type_ufp(pdo::SOPProductTypeUFP::PDUSBPeripheral)
+        .with_product_type_dfp(pdo::SOPProductTypeDFP::NotDFP)
+        .with_vid(0xc0ed);
+
+    let cert_vdo = CertStatVDO(0x55aaaa55);
+
+    let product_vdo = ProductVDO(0).with_pid(0xc0ed).with_bcd_device(0x0100);
+
+    let product_type_vdo = UFPTypeVDO(0)
+        .with_usb_highest_speed(USBHighestSpeed::USB20Only as u8)
+        .with_device_capability(0x1)
+        .with_version(UFPVDOVersion::Version1_3 as u8);
+
+    // let mut VDOs = heapless::Vec::<u32, 5>::new();
+
+    // VDOs.push(vdm_header_vdo.into()).unwrap_or_default();
+    // VDOs.push(id_header_vdo.into()).unwrap_or_default();
+    // VDOs.push(cert_vdo.into()).unwrap_or_default();
+    // VDOs.push(product_vdo.into()).unwrap_or_default();
+    // VDOs.push(product_type_vdo.into()).unwrap_or_default();
 
     loop {
         Timer::after_millis(100).await;
@@ -164,7 +238,7 @@ async fn pd_task(mut pd: PDSink) -> ! {
                         pdos.borrow_mut().ready = Some(accepted);
                     });
                 }
-                Event::VDM((hdr, data)) => {
+                Event::VDMReceived((hdr, data)) => {
                     match hdr {
                         VDMHeader::Structured(hdr) => {
                             info!(
